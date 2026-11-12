@@ -1,0 +1,46 @@
+[package]
+name = "sui-seal-client"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.88"
+description = "High-level Rust client for Mysten Seal (threshold encryption with onchain access control on Sui)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bugnarokdev/sui-seal-client"
+homepage = "https://github.com/bugnarokdev/sui-seal-client"
+documentation = "https://github.com/bugnarokdev/sui-seal-client"
+readme = "README.md"
+keywords = ["sui", "seal", "encryption", "walrus", "threshold"]
+categories = ["cryptography", "api-bindings"]
+publish = false
+
+[dependencies]
+# Mysten Seal primitives, pinned to tag seal-v0.6.16 by commit hash.
+seal-sdk = { git = "https://github.com/MystenLabs/seal", rev = "54eff6a7621b9b45905876a4ffd3e675e03a9bfc" }
+crypto = { package = "crypto", git = "https://github.com/MystenLabs/seal", rev = "54eff6a7621b9b45905876a4ffd3e675e03a9bfc" }
+# Same fastcrypto revision as seal-v0.6.16, so types unify.
+fastcrypto = { git = "https://github.com/MystenLabs/fastcrypto", rev = "076bf5ad8cea140dc7cf5c5861c24a36acdf64ce", features = ["aes"] }
+
+sui-sdk-types = { version = "0.4", features = ["serde", "hash"] }
+sui-crypto = { version = "0.4", features = ["ed25519"] }
+sui-rpc = "0.4"
+tonic = { version = "0.14", default-features = false }
+
+bcs = "0.2.1"
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
+hex = "0.4"
+rand = "0.8.5"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["time", "macros", "rt-multi-thread"] }
+futures = "0.3"
+tracing = "0.1"
+uuid = { version = "1", features = ["v4"] }
+zeroize = "1"
+
+[dev-dependencies]
+sui-crypto = { version = "0.4", features = ["ed25519", "bech32"] }
+tokio = { version = "1", features = ["full"] }
+serde_json = "1"
+rand = "0.8.5"

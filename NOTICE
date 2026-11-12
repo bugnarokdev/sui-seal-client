@@ -1,0 +1,14 @@
+sui-seal-client
+Copyright (c) 2026 BugNaRok
+
+This crate depends on, and does not modify, the following Apache-2.0 code from
+Mysten Labs, pulled by git at a pinned commit:
+  - crates/crypto and crates/seal-sdk from https://github.com/MystenLabs/seal
+    (tag seal-v0.6.16, commit 54eff6a7621b9b45905876a4ffd3e675e03a9bfc)
+  - fastcrypto from https://github.com/MystenLabs/fastcrypto
+    (commit 076bf5ad8cea140dc7cf5c5861c24a36acdf64ce)
+
+move/allowlist/sources/allowlist.move is adapted from
+move/patterns/sources/whitelist.move in MystenLabs/seal (Apache-2.0,
+Copyright (c) Mysten Labs, Inc.), extended with the revocation epoch variant
+described in that file's notes.

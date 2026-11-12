@@ -1,0 +1,13 @@
+{
+  "name": "sui-seal-client-interop",
+  "private": true,
+  "type": "module",
+  "description": "Cross-compatibility tests between sui-seal-client (Rust) and the official @mysten/seal SDK, on Sui testnet.",
+  "scripts": {
+    "test": "node interop.mjs"
+  },
+  "dependencies": {
+    "@mysten/seal": "1.5.4",
+    "@mysten/sui": "2.39.1"
+  }
+}

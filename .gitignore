@@ -1,0 +1,6 @@
+/target
+Cargo.lock.bak
+move/**/build/
+tests/interop/node_modules/
+.testnet.env
+*.key
