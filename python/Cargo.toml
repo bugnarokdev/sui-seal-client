@@ -1,0 +1,25 @@
+[package]
+name = "sui-seal-client-py"
+version = "0.2.0"
+edition = "2024"
+rust-version = "1.88"
+description = "Python bindings for sui-seal-client (BETA)"
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/bugnarokdev/sui-seal-client"
+publish = false
+
+# Standalone crate (not a member of the root package's build): the extension module
+# links against libpython and must not be built by a plain `cargo test` at the root.
+[workspace]
+
+[lib]
+name = "sui_seal_client"
+crate-type = ["cdylib"]
+
+[dependencies]
+sui-seal-client = { path = "..", features = ["testing"] }
+pyo3 = { version = "=0.30.1", features = ["extension-module", "abi3-py39"] }
+sui-crypto = { version = "0.4", features = ["ed25519", "bech32"] }
+sui-sdk-types = "0.4"
+tokio = { version = "1", features = ["rt-multi-thread", "time"] }
+hex = "0.4"

@@ -1,0 +1,32 @@
+[build-system]
+requires = ["maturin==1.16.0"]
+build-backend = "maturin"
+
+[project]
+name = "sui-seal-client"
+version = "0.2.0"
+description = "Python bindings for sui-seal-client, a Rust client for Mysten Seal (BETA, testnet)"
+readme = "README.md"
+requires-python = ">=3.9"
+license = { text = "MIT OR Apache-2.0" }
+authors = [{ name = "BugNaRok" }]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Programming Language :: Rust",
+    "Programming Language :: Python :: 3",
+    "Topic :: Security :: Cryptography",
+]
+
+[project.urls]
+Repository = "https://github.com/bugnarokdev/sui-seal-client"
+
+[project.optional-dependencies]
+test = ["pytest==8.4.2"]
+
+[tool.maturin]
+module-name = "sui_seal_client"
+features = ["pyo3/extension-module"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = ["testnet: talks to Sui testnet and the Mysten key servers (needs .testnet.env)"]
