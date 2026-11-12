@@ -1,0 +1,143 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      testnet:
+        description: "Also run the testnet suites (Rust e2e + TypeScript interop)"
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  SUI_VERSION: testnet-v1.84.0
+
+jobs:
+  rust:
+    name: Rust (fmt, clippy, test, doc)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - name: fmt
+        run: cargo fmt --all -- --check
+      - name: clippy
+        run: cargo clippy --all-targets -- -D warnings
+      - name: test (unit + doctests, offline)
+        run: cargo test
+      - name: doc
+        run: cargo doc --no-deps
+        env:
+          RUSTDOCFLAGS: -D warnings
+
+  move:
+    name: Move (sui move test)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install sui CLI (${{ env.SUI_VERSION }})
+        run: |
+          set -euo pipefail
+          url="https://github.com/MystenLabs/sui/releases/download/${SUI_VERSION}/sui-${SUI_VERSION}-ubuntu-x86_64.tgz"
+          mkdir -p "$RUNNER_TEMP/sui"
+          curl -fsSL --retry 3 "$url" | tar -xz -C "$RUNNER_TEMP/sui"
+          bin=$(find "$RUNNER_TEMP/sui" -type f -name sui -perm -u+x | head -n1)
+          install -m 755 "$bin" "$RUNNER_TEMP/sui-cli"
+          rm -rf "$RUNNER_TEMP/sui"
+          mkdir -p "$HOME/.local/bin" && mv "$RUNNER_TEMP/sui-cli" "$HOME/.local/bin/sui"
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: sui move test
+        working-directory: move/allowlist
+        run: |
+          sui --version
+          sui move test
+
+  # Manual only: talks to Sui testnet and the Mysten Seal key servers.
+  # Required repository secrets (Settings > Secrets and variables > Actions; not created by this repo):
+  #   SEAL_KEY_A  admin key file content (base64 flag||privkey, as written by
+  #               `sui keytool generate`); this address must hold testnet SUI.
+  #   SEAL_KEY_B  member key file content.
+  #   SEAL_KEY_C  outsider key file content.
+  # Optional repository variable:
+  #   SEAL_PACKAGE  allowlist package id (defaults to the deployment in README.md).
+  testnet:
+    name: Testnet (Rust e2e + TS interop)
+    if: github.event_name == 'workflow_dispatch' && inputs.testnet
+    needs: [rust, move]
+    runs-on: ubuntu-24.04
+    env:
+      SEAL_PACKAGE: ${{ vars.SEAL_PACKAGE || '0xe10fbae08333748f310adc926904980c6ced589a75a774bff4dfc462567d7f1b' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: "24"
+      - name: Install sui CLI (${{ env.SUI_VERSION }})
+        run: |
+          set -euo pipefail
+          url="https://github.com/MystenLabs/sui/releases/download/${SUI_VERSION}/sui-${SUI_VERSION}-ubuntu-x86_64.tgz"
+          mkdir -p "$RUNNER_TEMP/sui"
+          curl -fsSL --retry 3 "$url" | tar -xz -C "$RUNNER_TEMP/sui"
+          bin=$(find "$RUNNER_TEMP/sui" -type f -name sui -perm -u+x | head -n1)
+          install -m 755 "$bin" "$RUNNER_TEMP/sui-cli"
+          rm -rf "$RUNNER_TEMP/sui"
+      - name: Write testnet config (keys stay in RUNNER_TEMP)
+        env:
+          SEAL_KEY_A: ${{ secrets.SEAL_KEY_A }}
+          SEAL_KEY_B: ${{ secrets.SEAL_KEY_B }}
+          SEAL_KEY_C: ${{ secrets.SEAL_KEY_C }}
+        run: |
+          set -euo pipefail
+          umask 077
+          d="$RUNNER_TEMP/seal-testnet"
+          mkdir -p "$d"
+          for k in A B C; do
+            v="SEAL_KEY_$k"
+            if [ -z "${!v}" ]; then echo "::error::secret $v is not set"; exit 1; fi
+            printf '%s' "${!v}" > "$d/$k.key"
+          done
+          printf '["%s"]' "$SEAL_KEY_A" > "$d/sui.keystore"
+          addr_a=$("$RUNNER_TEMP/sui-cli" keytool --keystore-path "$d/sui.keystore" --json list \
+            | python3 -c 'import json,sys; print(json.load(sys.stdin)[0]["suiAddress"])')
+          cat > "$d/client.yaml" <<YAML
+          ---
+          keystore:
+            File: $d/sui.keystore
+          external_keys: ~
+          envs:
+            - alias: testnet
+              rpc: "https://fullnode.testnet.sui.io:443"
+              ws: ~
+              basic_auth: ~
+              chain_id: 4c78adac
+          active_env: testnet
+          active_address: "$addr_a"
+          YAML
+          cat > .testnet.env <<ENV
+          SUI_BIN=$RUNNER_TEMP/sui-cli
+          SUI_CLIENT_CONFIG=$d/client.yaml
+          SEAL_PACKAGE=$SEAL_PACKAGE
+          KEY_A=$d/A.key
+          KEY_B=$d/B.key
+          KEY_C=$d/C.key
+          ENV
+      - name: Testnet suites
+        run: scripts/testnet-e2e.sh
+      - name: Clean up keys
+        if: always()
+        run: rm -rf "$RUNNER_TEMP/seal-testnet" .testnet.env

@@ -15,8 +15,6 @@ published high-level client. This crate fills that gap.
 > - Not on crates.io yet: Mysten's `seal-sdk` and `crypto` crates are only available by
 >   git, and crates.io refuses git dependencies. Use it as a git dependency for now:
 >   `sui-seal-client = { git = "https://github.com/bugnarokdev/sui-seal-client" }`.
-> - The allowlist Move package used by the tests is currently owned by a test key. It
->   will be republished under the maintainer's key before any public demo.
 
 ## What it does
 
@@ -144,8 +142,32 @@ exactly) runs on testnet against the Mysten servers:
 
 `scripts/testnet-e2e.sh` reads `.testnet.env` (not committed); see the script header.
 
-Testnet deployment of the allowlist package used by the tests:
-`0x4aaa5d046c1fb02d048f23e7d02802d5676fd1f4fe29a2113ecd5d5a110b5c89`.
+### CI
+
+`.github/workflows/ci.yml` runs on every push and pull request: `cargo fmt --check`,
+`cargo clippy -D warnings`, `cargo test` (unit + doctests), `cargo doc` with warnings
+denied, and `sui move test` (sui CLI `testnet-v1.84.0`). The toolchain is pinned in
+`rust-toolchain.toml`.
+
+The testnet suites only run on a manual `workflow_dispatch`. They need three repository
+secrets, each holding a key file as written by `sui keytool generate` (base64
+`flag || private key`):
+
+| Secret | Role |
+|---|---|
+| `SEAL_KEY_A` | allowlist admin; must hold testnet SUI for gas |
+| `SEAL_KEY_B` | member |
+| `SEAL_KEY_C` | outsider |
+
+An optional repository variable `SEAL_PACKAGE` overrides the allowlist package id.
+
+Testnet deployment of the allowlist package used by the tests (also recorded in
+`move/allowlist/Published.toml`):
+
+- Package: `0xe10fbae08333748f310adc926904980c6ced589a75a774bff4dfc462567d7f1b`
+- Published by the project owner address
+  `0xa0ea7153821aaae60e3251b732533c44f3143df1e07207d18b9276062c2f8c06`, which holds the
+  `UpgradeCap` (`0xff51af9c9009a3206e1cd52bf88fa3522b33e4eca5d78c7de11a21d9dd6a2780`).
 
 ## License
 
