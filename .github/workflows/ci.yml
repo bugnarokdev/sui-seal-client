@@ -7,7 +7,7 @@ on:
   workflow_dispatch:
     inputs:
       testnet:
-        description: "Also run the testnet suites (Rust e2e + TypeScript interop)"
+        description: "Also run the testnet suites (Rust e2e + TypeScript interop + Python)"
         type: boolean
         default: true
 
@@ -35,16 +35,24 @@ jobs:
         run: cargo fmt --all -- --check
       - name: clippy
         run: cargo clippy --all-targets -- -D warnings
+      - name: clippy (all features)
+        run: cargo clippy --all-targets --all-features -- -D warnings
       - name: test (unit + doctests, offline)
         run: cargo test
+      - name: test (all features)
+        run: cargo test --all-features
       - name: doc
-        run: cargo doc --no-deps
+        run: cargo doc --no-deps --all-features
         env:
           RUSTDOCFLAGS: -D warnings
 
   move:
-    name: Move (sui move test)
+    name: Move (sui move test, ${{ matrix.package }})
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        package: [allowlist, policies]
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install sui CLI (${{ env.SUI_VERSION }})
@@ -59,10 +67,37 @@ jobs:
           mkdir -p "$HOME/.local/bin" && mv "$RUNNER_TEMP/sui-cli" "$HOME/.local/bin/sui"
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
       - name: sui move test
-        working-directory: move/allowlist
+        working-directory: move/${{ matrix.package }}
         run: |
+          set -o pipefail
           sui --version
-          sui move test
+          sui move test 2>&1 | tee "$RUNNER_TEMP/move-test.log"
+          if grep -q '^warning' "$RUNNER_TEMP/move-test.log"; then echo "::error::Move warnings"; exit 1; fi
+
+  # BETA (v0.2): PyO3 bindings, offline tests (testnet tests skip without .testnet.env).
+  python:
+    name: Python bindings (maturin, pytest)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Install toolchain from rust-toolchain.toml
+        run: rustup toolchain install && rustup show active-toolchain
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          workspaces: python
+      - name: fmt + clippy
+        working-directory: python
+        run: |
+          cargo fmt -- --check
+          cargo clippy --all-targets -- -D warnings
+      - name: build and test
+        working-directory: python
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet maturin==1.16.0 pytest==8.4.2
+          maturin develop --release
+          pytest -m "not testnet" -q
 
   # Manual only: talks to Sui testnet and the Mysten Seal key servers.
   # Required repository secrets (Settings > Secrets and variables > Actions; not created by this repo):
@@ -70,15 +105,19 @@ jobs:
   #               `sui keytool generate`); this address must hold testnet SUI.
   #   SEAL_KEY_B  member key file content.
   #   SEAL_KEY_C  outsider key file content.
-  # Optional repository variable:
-  #   SEAL_PACKAGE  allowlist package id (defaults to the deployment in README.md).
+  # Optional repository variables (default to the deployments in README.md):
+  #   SEAL_PACKAGE           allowlist package id.
+  #   SEAL_POLICIES          seal_policies package id.
+  #   SEAL_POLICIES_VERSION  its subscription::PackageVersion shared object.
   testnet:
-    name: Testnet (Rust e2e + TS interop)
+    name: Testnet (Rust e2e + TS interop + Python)
     if: github.event_name == 'workflow_dispatch' && inputs.testnet
-    needs: [rust, move]
+    needs: [rust, move, python]
     runs-on: ubuntu-24.04
     env:
       SEAL_PACKAGE: ${{ vars.SEAL_PACKAGE || '0xe10fbae08333748f310adc926904980c6ced589a75a774bff4dfc462567d7f1b' }}
+      SEAL_POLICIES: ${{ vars.SEAL_POLICIES || '0x7b4d1e42efe6673d3687de0b919689b422197d4dc9ac9bfd7ce0c27699e8ae6b' }}
+      SEAL_POLICIES_VERSION: ${{ vars.SEAL_POLICIES_VERSION || '0x64f48808beb2d21f1d7395978a83bb5483a0cc6fb98de977d7f4b035c7698b88' }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Install toolchain from rust-toolchain.toml
@@ -132,12 +171,22 @@ jobs:
           SUI_BIN=$RUNNER_TEMP/sui-cli
           SUI_CLIENT_CONFIG=$d/client.yaml
           SEAL_PACKAGE=$SEAL_PACKAGE
+          SEAL_POLICIES=$SEAL_POLICIES
+          SEAL_POLICIES_VERSION=$SEAL_POLICIES_VERSION
           KEY_A=$d/A.key
           KEY_B=$d/B.key
           KEY_C=$d/C.key
           ENV
       - name: Testnet suites
         run: scripts/testnet-e2e.sh
+      - name: Python testnet tests
+        working-directory: python
+        run: |
+          python3 -m venv .venv
+          . .venv/bin/activate
+          pip install --quiet maturin==1.16.0 pytest==8.4.2
+          maturin develop --release
+          pytest -m testnet -q
       - name: Clean up keys
         if: always()
         run: rm -rf "$RUNNER_TEMP/seal-testnet" .testnet.env
