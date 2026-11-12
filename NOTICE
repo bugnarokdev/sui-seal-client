@@ -12,3 +12,10 @@ move/allowlist/sources/allowlist.move is adapted from
 move/patterns/sources/whitelist.move in MystenLabs/seal (Apache-2.0,
 Copyright (c) Mysten Labs, Inc.), extended with the revocation epoch variant
 described in that file's notes.
+
+move/policies/sources/timelock.move, private_data.move and subscription.move are
+adapted from move/patterns/sources/tle.move, private_data.move and
+subscription.move in MystenLabs/seal at tag seal-v0.6.16 (Apache-2.0,
+Copyright (c) Mysten Labs, Inc.). Changes: the time-lock key id accepts a nonce
+after the unlock time; the subscription pattern adds subscribe_entry and set_fee
+and requires a non-empty nonce; tests rewritten.

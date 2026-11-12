@@ -20,20 +20,26 @@ export function loadKeypair(path) {
 }
 
 // Admin transactions go through the sui CLI with an isolated client config.
-export function suiCall(pkg, fn, args) {
+export function sui(argv, what) {
 	const out = execFileSync(
 		env('SUI_BIN'),
-		[
-			'client', '--client.config', env('SUI_CLIENT_CONFIG'), 'call',
-			'--package', pkg, '--module', 'allowlist', '--function', fn,
-			...(args.length ? ['--args', ...args] : []),
-			'--gas-budget', '20000000', '--json',
-		],
+		['client', '--client.config', env('SUI_CLIENT_CONFIG'), ...argv, '--gas-budget', '20000000', '--json'],
 		{ encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'] },
 	);
 	const json = JSON.parse(out.slice(out.indexOf('{')));
-	if (json.effects?.status?.status !== 'success') throw new Error(`${fn} failed: ${JSON.stringify(json.effects?.status)}`);
+	if (json.effects?.status?.status !== 'success') throw new Error(`${what} failed: ${JSON.stringify(json.effects?.status)}`);
 	return json;
+}
+
+export function suiCall(pkg, fn, args, module = 'allowlist') {
+	return sui(
+		['call', '--package', pkg, '--module', module, '--function', fn, ...(args.length ? ['--args', ...args] : [])],
+		fn,
+	);
+}
+
+export function createdId(res, suffix) {
+	return res.objectChanges.find((c) => c.type === 'created' && c.objectType.endsWith(suffix)).objectId;
 }
 
 export function createAllowlist(pkg) {
@@ -51,10 +57,10 @@ export function keyId(list, epoch) {
 	return list.replace(/^0x/, '') + e.toString('hex') + toHex(randomBytes(16));
 }
 
-export function rust(args, keyFile) {
+export function rust(args, keyFile, extraEnv = {}) {
 	const r = spawnSync(env('RUST_CLI'), args, {
 		encoding: 'utf8',
-		env: { ...process.env, ...(keyFile ? { SEAL_KEY_FILE: keyFile } : {}) },
+		env: { ...process.env, ...(keyFile ? { SEAL_KEY_FILE: keyFile } : {}), ...extraEnv },
 	});
 	return { code: r.status, stderr: r.stderr, stdout: r.stdout };
 }

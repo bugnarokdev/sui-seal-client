@@ -5,21 +5,21 @@ use std::fmt;
 use std::time::Duration;
 
 use crypto::ibe::UserSecretKey;
-use crypto::{EncryptedObject, EncryptionInput, ObjectID};
+use crypto::{EncryptedObject, EncryptionInput, IBEPublicKeys, IBEUserSecretKeys, ObjectID};
 use fastcrypto::encoding::{Base64, Encoding};
 use futures::stream::{FuturesUnordered, StreamExt};
 use seal_sdk::types::{ElGamalPublicKey, ElgamalVerificationKey};
 use seal_sdk::{
     ElGamalSecretKey, FetchKeyRequest, FetchKeyResponse, IBEPublicKey, decrypt_seal_responses,
-    seal_decrypt_object, seal_encrypt,
+    seal_encrypt,
 };
 use serde::Deserialize;
 use sui_sdk_types::Address;
 use zeroize::Zeroizing;
 
 use crate::approval::{ApprovalArg, ApprovalTx};
-use crate::config::{RetryPolicy, SealConfig, validate_threshold};
-use crate::error::{Error, Failures, KeyServerErrorKind, Result};
+use crate::config::{RetryPolicy, SealConfig, validate_weights};
+use crate::error::{Error, Failures, KeyServerErrorKind, Result, is_wrong_owner_message};
 use crate::key_server::{self, KeyServer};
 use crate::rpc::Rpc;
 use crate::session::{PersonalMessageSigner, SessionKey};
@@ -62,7 +62,7 @@ fn decode(bytes: &[u8]) -> Result<EncryptedObject> {
 /// public key. Indexed by full id, then by key server.
 #[derive(Default)]
 pub struct DerivedKeys {
-    keys: HashMap<Vec<u8>, HashMap<ObjectID, UserSecretKey>>,
+    pub(crate) keys: HashMap<Vec<u8>, HashMap<ObjectID, UserSecretKey>>,
 }
 
 impl fmt::Debug for DerivedKeys {
@@ -116,7 +116,7 @@ impl SealClient {
         let http = http_client()?;
         let mut servers = Vec::with_capacity(config.key_servers.len());
         for id in &config.key_servers {
-            let server = key_server::retrieve(&rpc, *id).await?;
+            let server = key_server::retrieve(&rpc, *id, &config.options_for(id)).await?;
             if config.verify_key_servers {
                 key_server::verify(&http, &server, config.timeout).await?;
             }
@@ -132,15 +132,17 @@ impl SealClient {
         })
     }
 
-    /// Builds a client from known key servers, without onchain reads.
-    /// `session_key` and `shared_object` then need a fullnode: use [`SealClient::connect`].
+    /// Builds a client from known key servers, without onchain reads. Weights and API
+    /// keys are taken from each [`KeyServer`]. `session_key` and `shared_object` then
+    /// need a fullnode: use [`SealClient::connect`].
     pub fn with_key_servers(servers: Vec<KeyServer>, threshold: u8) -> Result<Self> {
         let config = SealConfig {
             key_servers: servers.iter().map(|s| s.object_id).collect(),
-            threshold,
+            threshold: 1,
             ..SealConfig::testnet()
         };
         config.validate()?;
+        validate_weights(total_weight(&servers), threshold)?;
         Ok(Self {
             servers,
             threshold,
@@ -165,6 +167,20 @@ impl SealClient {
         self.threshold
     }
 
+    /// Sum of the configured server weights.
+    pub fn total_weight(&self) -> usize {
+        total_weight(&self.servers)
+    }
+
+    /// Server ids with multiplicity (one entry per unit of weight), in configuration
+    /// order: the share layout of encrypted objects, as in `@mysten/seal`.
+    fn weighted_servers(&self) -> Vec<&KeyServer> {
+        self.servers
+            .iter()
+            .flat_map(|s| std::iter::repeat_n(s, usize::from(s.weight())))
+            .collect()
+    }
+
     /// Encrypts `plaintext` for `package_id || id` with AES-256-GCM.
     ///
     /// Returns the encrypted object (BCS). The symmetric key produced by the encryption
@@ -185,8 +201,8 @@ impl SealClient {
         if id.is_empty() {
             return Err(Error::InvalidInput("key id must not be empty".into()));
         }
-        validate_threshold(self.threshold, self.servers.len())?;
-        let refs: Vec<&KeyServer> = self.servers.iter().collect();
+        validate_weights(self.total_weight(), self.threshold)?;
+        let refs = self.weighted_servers();
         let input = EncryptionInput::Aes256Gcm {
             data: plaintext.to_vec(),
             aad: aad.map(<[u8]>::to_vec),
@@ -194,7 +210,7 @@ impl SealClient {
         let (object, dem_key) = seal_encrypt(
             package_id,
             id.to_vec(),
-            self.servers.iter().map(|s| s.object_id).collect(),
+            refs.iter().map(|s| s.object_id).collect(),
             &key_server::public_keys(&refs),
             self.threshold,
             input,
@@ -229,6 +245,14 @@ impl SealClient {
             id,
             initial_shared_version: rpc.initial_shared_version(&id).await?,
         })
+    }
+
+    /// Argument for any object, read onchain: shared objects become
+    /// [`ApprovalArg::Shared`], owned and immutable ones [`ApprovalArg::Object`] at their
+    /// current version. Owned objects are only accepted by key servers when the session
+    /// address owns them. BETA (v0.2).
+    pub async fn object_arg(&self, id: Address) -> Result<ApprovalArg> {
+        self.require_rpc()?.object_arg(&id).await
     }
 
     fn require_rpc(&self) -> Result<&Rpc> {
@@ -275,7 +299,7 @@ impl SealClient {
             .to_json_string()
             .map_err(|e| Error::Decode(format!("request: {e}")))?;
 
-        let threshold = self.threshold as usize;
+        let threshold = usize::from(self.threshold);
         let mut pending: FuturesUnordered<_> = self
             .servers
             .iter()
@@ -286,11 +310,13 @@ impl SealClient {
             .collect();
         let mut responses: Vec<(ObjectID, FetchKeyResponse)> = Vec::new();
         let mut failures: Vec<Error> = Vec::new();
+        let mut weight = 0usize;
         while let Some((server, result)) = pending.next().await {
             match result {
                 Ok(response) => {
                     responses.push((server.object_id, response));
-                    if responses.len() >= threshold {
+                    weight += usize::from(server.weight());
+                    if weight >= threshold {
                         break;
                     }
                 }
@@ -298,9 +324,9 @@ impl SealClient {
             }
         }
         drop(pending);
-        if responses.len() < threshold {
+        if weight < threshold {
             return Err(Error::ThresholdNotReached {
-                got: responses.len(),
+                got: weight,
                 threshold,
                 failures: Failures(failures),
             });
@@ -319,7 +345,9 @@ impl SealClient {
                 Err(e) => {
                     attempt += 1;
                     let retryable = match &e {
-                        Error::KeyServer { kind, .. } => kind.is_retryable(),
+                        Error::KeyServer { kind, message, .. } => {
+                            kind.is_retryable() && !is_wrong_owner_message(kind, message)
+                        }
                         Error::Transport(_) => true,
                         _ => false,
                     };
@@ -335,9 +363,8 @@ impl SealClient {
 
     async fn fetch_once(&self, server: &KeyServer, body: String) -> Result<FetchKeyResponse> {
         let request_id = uuid::Uuid::new_v4().to_string();
-        let response = self
-            .http
-            .post(format!("{}/v1/fetch_key", server.url))
+        let response = server
+            .authorize(self.http.post(format!("{}/v1/fetch_key", server.url)))
             .header("Content-Type", "application/json")
             .header("Request-Id", &request_id)
             .header("Client-Sdk-Type", SDK_TYPE)
@@ -393,15 +420,42 @@ impl SealClient {
     pub fn decrypt(&self, encrypted: &[u8], keys: &DerivedKeys) -> Result<Vec<u8>> {
         let object = decode(encrypted)?;
         let pk_map = self.pk_map();
+        let mut pks = Vec::with_capacity(object.services.len());
         for (id, _) in &object.services {
-            if !pk_map.contains_key(id) {
-                return Err(Error::InvalidInput(format!(
+            let pk = pk_map.get(id).ok_or_else(|| {
+                Error::InvalidInput(format!(
                     "encrypted object uses key server {id}, which is not configured"
-                )));
-            }
+                ))
+            })?;
+            pks.push(*pk);
         }
-        seal_decrypt_object(&object, &keys.keys, &pk_map)
-            .map_err(|e| Error::Crypto(format!("decrypt: {e}")))
+        let full_id = crypto::create_full_id(&object.package_id.into_inner(), &object.id);
+        let available = keys.keys.get(&full_id).ok_or_else(|| {
+            Error::Crypto("decrypt: no keys for this encrypted object's id".into())
+        })?;
+        // Weighted servers appear several times in `services`; each occurrence is a share.
+        let usks: HashMap<ObjectID, UserSecretKey> = object
+            .services
+            .iter()
+            .filter_map(|(id, _)| available.get(id).map(|k| (*id, *k)))
+            .collect();
+        let shares = object
+            .services
+            .iter()
+            .filter(|(id, _)| usks.contains_key(id))
+            .count();
+        if shares < usize::from(object.threshold) {
+            return Err(Error::Crypto(format!(
+                "decrypt: keys cover {shares} shares, threshold is {}",
+                object.threshold
+            )));
+        }
+        crypto::seal_decrypt(
+            &object,
+            &IBEUserSecretKeys::BonehFranklinBLS12381(usks),
+            Some(&IBEPublicKeys::BonehFranklinBLS12381(pks)),
+        )
+        .map_err(|e| Error::Crypto(format!("decrypt: {e}")))
     }
 
     /// Fetches the keys for one encrypted object and decrypts it.
@@ -427,6 +481,10 @@ struct ErrorBody {
     error: String,
     #[serde(default)]
     message: String,
+}
+
+fn total_weight(servers: &[KeyServer]) -> usize {
+    servers.iter().map(|s| usize::from(s.weight())).sum()
 }
 
 fn truncate(s: &str) -> String {
@@ -603,5 +661,423 @@ mod tests {
         assert!(KeyServerErrorKind::from_code("InvalidParameter").is_retryable());
         assert!(!KeyServerErrorKind::from_code("NoAccess").is_retryable());
         assert!(!KeyServerErrorKind::from_code("InvalidSignature").is_retryable());
+    }
+
+    // ---- v0.2: weights, mock HTTP key servers --------------------------------------
+
+    use crate::testing::{LocalKeyServer, derive_keys};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    fn locals_weighted(weights: &[u8]) -> Vec<LocalKeyServer> {
+        weights
+            .iter()
+            .enumerate()
+            .map(|(i, w)| {
+                LocalKeyServer::generate(Address::new([0x40 + i as u8; 32]), &format!("w{i}"))
+                    .with_weight(*w)
+                    .unwrap()
+            })
+            .collect()
+    }
+
+    fn client_of(locals: &[LocalKeyServer], threshold: u8) -> SealClient {
+        SealClient::with_key_servers(
+            locals.iter().map(|l| l.key_server().clone()).collect(),
+            threshold,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn weighted_server_holds_several_shares() {
+        // Weights 2 + 1, threshold 2: the weight-2 server alone is enough, the other is not.
+        let locals = locals_weighted(&[2, 1]);
+        let client = client_of(&locals, 2);
+        assert_eq!(client.total_weight(), 3);
+        let pkg = Address::new([7; 32]);
+        let ct = client.encrypt(pkg, b"w", b"weighted").unwrap();
+        let info = parse_encrypted_object(&ct).unwrap();
+        assert_eq!(
+            info.key_servers,
+            vec![
+                locals[0].key_server().object_id,
+                locals[0].key_server().object_id,
+                locals[1].key_server().object_id
+            ]
+        );
+        let heavy = derive_keys(&[&locals[0]], &pkg, b"w");
+        assert_eq!(client.decrypt(&ct, &heavy).unwrap(), b"weighted");
+        let light = derive_keys(&[&locals[1]], &pkg, b"w");
+        let err = client.decrypt(&ct, &light).unwrap_err().to_string();
+        assert!(err.contains("1 shares, threshold is 2"), "{err}");
+        let both = derive_keys(&[&locals[0], &locals[1]], &pkg, b"w");
+        assert_eq!(client.decrypt(&ct, &both).unwrap(), b"weighted");
+    }
+
+    #[test]
+    fn weights_are_validated() {
+        let locals = locals_weighted(&[2, 1]);
+        assert!(SealClient::with_key_servers(vec![locals[0].key_server().clone()], 3).is_err());
+        assert!(SealClient::with_key_servers(vec![locals[0].key_server().clone()], 2).is_ok());
+        let big = locals_weighted(&[200, 100]);
+        assert!(
+            SealClient::with_key_servers(big.iter().map(|l| l.key_server().clone()).collect(), 1)
+                .is_err()
+        );
+    }
+
+    #[test]
+    fn unweighted_layout_matches_v01() {
+        // Weight 1 everywhere: one share per server, in configuration order.
+        let locals = locals_weighted(&[1, 1, 1]);
+        let ct = client_of(&locals, 2)
+            .encrypt(Address::ZERO, b"x", b"y")
+            .unwrap();
+        let info = parse_encrypted_object(&ct).unwrap();
+        let ids: Vec<_> = locals.iter().map(|l| l.key_server().object_id).collect();
+        assert_eq!(info.key_servers, ids);
+    }
+
+    #[derive(Clone)]
+    enum Behaviour {
+        Approve,
+        Refuse,
+        /// Answer `Failure` (503) this many times, then approve.
+        FailFirst(usize),
+        /// Approve only when this header carries this value.
+        RequireHeader(&'static str, &'static str),
+        /// Answer like a fullnode rejecting an owned object of someone else.
+        WrongOwner,
+        /// Answer `InvalidParameter` (object not indexed yet) this many times.
+        NotIndexedFirst(usize),
+    }
+
+    struct Mock {
+        url: String,
+        hits: Arc<AtomicUsize>,
+    }
+
+    /// Minimal HTTP/1.1 key server: decodes the PTB, extracts the key for every id and
+    /// ElGamal-encrypts it to the request's `enc_key`, as a real server does after the
+    /// dry run approved.
+    async fn spawn_mock(local: Arc<LocalKeyServer>, behaviour: Behaviour) -> Mock {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let hits = Arc::new(AtomicUsize::new(0));
+        let counter = hits.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut sock, _)) = listener.accept().await else {
+                    return;
+                };
+                let local = local.clone();
+                let behaviour = behaviour.clone();
+                let n = counter.fetch_add(1, Ordering::SeqCst);
+                tokio::spawn(async move {
+                    let mut buf = Vec::new();
+                    let mut chunk = [0u8; 8192];
+                    let (head_end, len) = loop {
+                        let r = sock.read(&mut chunk).await.unwrap();
+                        if r == 0 {
+                            return;
+                        }
+                        buf.extend_from_slice(&chunk[..r]);
+                        if let Some(p) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                            let head = String::from_utf8_lossy(&buf[..p]).to_lowercase();
+                            let len = head
+                                .lines()
+                                .find_map(|l| {
+                                    l.strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            break (p + 4, len);
+                        }
+                    };
+                    while buf.len() < head_end + len {
+                        let r = sock.read(&mut chunk).await.unwrap();
+                        if r == 0 {
+                            break;
+                        }
+                        buf.extend_from_slice(&chunk[..r]);
+                    }
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+                    let body = &buf[head_end..];
+                    let (status, reply) = answer(&local, &behaviour, n, &head, body);
+                    let resp = format!(
+                        "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nX-KeyServer-Version: 0.6.16\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{reply}",
+                        reply.len()
+                    );
+                    let _ = sock.write_all(resp.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        Mock { url, hits }
+    }
+
+    fn answer(
+        local: &LocalKeyServer,
+        behaviour: &Behaviour,
+        n: usize,
+        head: &str,
+        body: &[u8],
+    ) -> (&'static str, String) {
+        let refuse =
+            |status, code: &str| (status, format!(r#"{{"error":"{code}","message":"mock"}}"#));
+        match behaviour {
+            Behaviour::Refuse => return refuse("403 Forbidden", "NoAccess"),
+            Behaviour::WrongOwner => {
+                return (
+                    "403 Forbidden",
+                    r#"{"error":"InvalidParameter","message":"Transaction was not signed by the correct sender: Object 0x1 is owned by account address 0x2"}"#.to_string(),
+                );
+            }
+            Behaviour::NotIndexedFirst(k) if n < *k => {
+                return refuse("403 Forbidden", "InvalidParameter");
+            }
+            Behaviour::FailFirst(k) if n < *k => {
+                return refuse("503 Service Unavailable", "Failure");
+            }
+            Behaviour::RequireHeader(name, value) => {
+                let want = format!("{}: {}", name.to_lowercase(), value);
+                if !head
+                    .lines()
+                    .any(|l| l.to_lowercase() == want.to_lowercase())
+                {
+                    return refuse("400 Bad Request", "MissingRequiredHeader");
+                }
+            }
+            _ => {}
+        }
+        let req: serde_json::Value = serde_json::from_slice(body).unwrap();
+        let ptb_bytes = Base64::decode(req["ptb"].as_str().unwrap()).unwrap();
+        let ptb: sui_sdk_types::ProgrammableTransaction = bcs::from_bytes(&ptb_bytes).unwrap();
+        let enc_key: ElGamalPublicKey = serde_json::from_value(req["enc_key"].clone()).unwrap();
+        let mut decryption_keys = Vec::new();
+        for cmd in &ptb.commands {
+            let sui_sdk_types::Command::MoveCall(call) = cmd else {
+                panic!("not a move call")
+            };
+            let sui_sdk_types::Argument::Input(i) = call.arguments[0] else {
+                panic!()
+            };
+            let sui_sdk_types::Input::Pure(raw) = &ptb.inputs[i as usize] else {
+                panic!()
+            };
+            let id: Vec<u8> = bcs::from_bytes(raw).unwrap();
+            let full = crypto::create_full_id(&call.package.into_inner(), &id);
+            let usk = local.extract(&full);
+            let encrypted_key = crypto::elgamal::encrypt(&mut thread_rng(), &usk, &enc_key);
+            decryption_keys.push(seal_sdk::types::DecryptionKey {
+                id: full,
+                encrypted_key,
+            });
+        }
+        (
+            "200 OK",
+            serde_json::to_string(&FetchKeyResponse { decryption_keys }).unwrap(),
+        )
+    }
+
+    fn fast_retry() -> RetryPolicy {
+        RetryPolicy {
+            max_attempts: 3,
+            initial_backoff: Duration::from_millis(10),
+            max_backoff: Duration::from_millis(20),
+        }
+    }
+
+    fn session(pkg: Address) -> SessionKey {
+        SessionKey::new(
+            pkg,
+            5,
+            &sui_crypto::ed25519::Ed25519PrivateKey::new([3; 32]),
+        )
+        .unwrap()
+    }
+
+    /// Spawns one mock per weight; returns the key servers (pointing at the mocks).
+    async fn mocked(weights: &[u8], behaviours: Vec<Behaviour>) -> (Vec<KeyServer>, Vec<Mock>) {
+        let mut servers = Vec::new();
+        let mut mocks = Vec::new();
+        for (l, b) in locals_weighted(weights).into_iter().zip(behaviours) {
+            let l = Arc::new(l);
+            let m = spawn_mock(l.clone(), b).await;
+            let mut server = l.key_server().clone();
+            server.url = m.url.clone();
+            servers.push(server);
+            mocks.push(m);
+        }
+        (servers, mocks)
+    }
+
+    #[tokio::test]
+    async fn fetch_over_http_and_decrypt() {
+        let (locals, mocks) = mocked(&[1, 1], vec![Behaviour::Approve, Behaviour::Approve]).await;
+        let client = SealClient::with_key_servers(locals.clone(), 2)
+            .unwrap()
+            .with_retry(fast_retry());
+        let pkg = Address::new([0x11; 32]);
+        let ct = client.encrypt(pkg, b"id-1", b"over http").unwrap();
+        let approval = ApprovalTx::new(pkg)
+            .call("m", "seal_approve", b"id-1", vec![])
+            .unwrap();
+        let pt = client
+            .fetch_and_decrypt(&ct, &session(pkg), &approval)
+            .await
+            .unwrap();
+        assert_eq!(pt, b"over http");
+        assert!(mocks.iter().all(|m| m.hits.load(Ordering::SeqCst) >= 1));
+    }
+
+    #[tokio::test]
+    async fn weight_reaches_threshold_without_the_refusing_server() {
+        // Weight-2 server approves, weight-1 server refuses; threshold 2 is met.
+        let (locals, _m) = mocked(&[2, 1], vec![Behaviour::Approve, Behaviour::Refuse]).await;
+        let client = SealClient::with_key_servers(locals.clone(), 2)
+            .unwrap()
+            .with_retry(fast_retry());
+        let pkg = Address::new([0x12; 32]);
+        let ct = client.encrypt(pkg, b"id", b"heavy").unwrap();
+        let approval = ApprovalTx::new(pkg)
+            .call("m", "seal_approve", b"id", vec![])
+            .unwrap();
+        assert_eq!(
+            client
+                .fetch_and_decrypt(&ct, &session(pkg), &approval)
+                .await
+                .unwrap(),
+            b"heavy"
+        );
+
+        // Reverse: only the weight-1 server approves, threshold 2 is not met.
+        let (locals, _m) = mocked(&[2, 1], vec![Behaviour::Refuse, Behaviour::Approve]).await;
+        let client = SealClient::with_key_servers(locals.clone(), 2)
+            .unwrap()
+            .with_retry(fast_retry());
+        let err = client
+            .fetch_keys(&session(pkg), &approval)
+            .await
+            .unwrap_err();
+        assert!(err.is_no_access(), "{err}");
+        assert!(
+            matches!(
+                err,
+                Error::ThresholdNotReached {
+                    got: 1,
+                    threshold: 2,
+                    ..
+                }
+            ),
+            "{err}"
+        );
+    }
+
+    #[tokio::test]
+    async fn transient_failures_are_retried() {
+        let (locals, mocks) = mocked(&[1], vec![Behaviour::FailFirst(2)]).await;
+        let client = SealClient::with_key_servers(vec![locals[0].clone()], 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        let pkg = Address::new([0x13; 32]);
+        let approval = ApprovalTx::new(pkg)
+            .call("m", "seal_approve", b"id", vec![])
+            .unwrap();
+        let keys = client.fetch_keys(&session(pkg), &approval).await.unwrap();
+        assert_eq!(keys.servers_for(&pkg, b"id"), 1);
+        assert_eq!(mocks[0].hits.load(Ordering::SeqCst), 3);
+
+        // More failures than attempts: gives up with the last error.
+        let (locals, mocks) = mocked(&[1], vec![Behaviour::FailFirst(10)]).await;
+        let client = SealClient::with_key_servers(vec![locals[0].clone()], 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        let err = client
+            .fetch_keys(&session(pkg), &approval)
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("Failure"), "{err}");
+        assert_eq!(mocks[0].hits.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn api_key_header_is_sent() {
+        let (locals, mocks) =
+            mocked(&[1], vec![Behaviour::RequireHeader("x-seal-key", "k-123")]).await;
+        let pkg = Address::new([0x14; 32]);
+        let approval = ApprovalTx::new(pkg)
+            .call("m", "seal_approve", b"id", vec![])
+            .unwrap();
+        let bare = SealClient::with_key_servers(vec![locals[0].clone()], 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        let err = bare.fetch_keys(&session(pkg), &approval).await.unwrap_err();
+        assert!(err.to_string().contains("MissingRequiredHeader"), "{err}");
+        assert_eq!(mocks[0].hits.load(Ordering::SeqCst), 1, "not retried");
+
+        let keyed = locals[0]
+            .clone()
+            .with_api_key(crate::ApiKey::new("x-seal-key", "k-123"))
+            .unwrap();
+        let client = SealClient::with_key_servers(vec![keyed], 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        let keys = client.fetch_keys(&session(pkg), &approval).await.unwrap();
+        assert_eq!(keys.servers_for(&pkg, b"id"), 1);
+    }
+
+    #[tokio::test]
+    async fn batch_of_ids_in_one_request() {
+        let (locals, _m) = mocked(
+            &[1, 1, 1],
+            vec![Behaviour::Approve, Behaviour::Refuse, Behaviour::Approve],
+        )
+        .await;
+        let client = SealClient::with_key_servers(locals.clone(), 2)
+            .unwrap()
+            .with_retry(fast_retry());
+        let pkg = Address::new([0x15; 32]);
+        let ids: Vec<Vec<u8>> = (0..5u8).map(|i| vec![i, 0xEE]).collect();
+        let cts: Vec<_> = ids
+            .iter()
+            .map(|id| client.encrypt(pkg, id, id).unwrap())
+            .collect();
+        let mut tx = ApprovalTx::new(pkg);
+        for id in &ids {
+            tx = tx.call("m", "seal_approve", id, vec![]).unwrap();
+        }
+        let keys = client.fetch_keys(&session(pkg), &tx).await.unwrap();
+        for (id, ct) in ids.iter().zip(&cts) {
+            assert_eq!(&client.decrypt(ct, &keys).unwrap(), id);
+        }
+    }
+
+    #[tokio::test]
+    async fn wrong_owner_is_not_retried_but_indexing_lag_is() {
+        let pkg = Address::new([0x16; 32]);
+        let approval = ApprovalTx::new(pkg)
+            .call("m", "seal_approve", b"id", vec![])
+            .unwrap();
+        let (servers, mocks) = mocked(&[1], vec![Behaviour::WrongOwner]).await;
+        let client = SealClient::with_key_servers(servers, 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        let err = client
+            .fetch_keys(&session(pkg), &approval)
+            .await
+            .unwrap_err();
+        assert!(err.is_wrong_owner(), "{err}");
+        assert!(!err.is_no_access());
+        assert_eq!(mocks[0].hits.load(Ordering::SeqCst), 1);
+
+        let (servers, mocks) = mocked(&[1], vec![Behaviour::NotIndexedFirst(2)]).await;
+        let client = SealClient::with_key_servers(servers, 1)
+            .unwrap()
+            .with_retry(fast_retry());
+        client.fetch_keys(&session(pkg), &approval).await.unwrap();
+        assert_eq!(mocks[0].hits.load(Ordering::SeqCst), 3);
     }
 }

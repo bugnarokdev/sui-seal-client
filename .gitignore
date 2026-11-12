@@ -4,3 +4,8 @@ move/**/build/
 tests/interop/node_modules/
 .testnet.env
 *.key
+python/target/
+python/.venv/
+**/__pycache__/
+*.so
+.pytest_cache/

@@ -18,8 +18,9 @@ pub enum Error {
         kind: KeyServerErrorKind,
         message: String,
     },
-    /// Not enough key servers answered to reach the threshold.
-    #[error("threshold not reached: {got} of {threshold} key servers answered ({failures})")]
+    /// Not enough key servers answered to reach the threshold. `got` and `threshold`
+    /// are weights (server counts when every weight is 1).
+    #[error("threshold not reached: weight {got} of {threshold} answered ({failures})")]
     ThresholdNotReached {
         got: usize,
         threshold: usize,
@@ -107,7 +108,28 @@ impl fmt::Display for KeyServerErrorKind {
     }
 }
 
+/// Text of the key server's (fullnode's) refusal when the approval transaction passes an
+/// owned object the session address does not own.
+const WRONG_OWNER_MARK: &str = "not signed by the correct sender";
+
+pub(crate) fn is_wrong_owner_message(kind: &KeyServerErrorKind, message: &str) -> bool {
+    *kind == KeyServerErrorKind::InvalidParameter && message.contains(WRONG_OWNER_MARK)
+}
+
 impl Error {
+    /// True when the approval transaction used an owned object (a `PrivateData`, a
+    /// `Subscription`...) that the session address does not own. Key servers report it
+    /// as `InvalidParameter` before running `seal_approve`; it is not retried. BETA.
+    pub fn is_wrong_owner(&self) -> bool {
+        match self {
+            Error::KeyServer { kind, message, .. } => is_wrong_owner_message(kind, message),
+            Error::ThresholdNotReached { failures, .. } => {
+                !failures.0.is_empty() && failures.0.iter().all(Error::is_wrong_owner)
+            }
+            _ => false,
+        }
+    }
+
     /// True when the error comes from a policy refusal (`seal_approve` aborted).
     pub fn is_no_access(&self) -> bool {
         match self {
@@ -167,5 +189,31 @@ mod tests {
             failures: Failures(vec![Error::Transport("down".into())]),
         };
         assert!(!e.is_no_access());
+    }
+
+    #[test]
+    fn wrong_owner_detection() {
+        let owned = |m: &str| Error::KeyServer {
+            server: "s".into(),
+            kind: KeyServerErrorKind::InvalidParameter,
+            message: m.into(),
+        };
+        let msg = "Invalid parameter to PTB: Transaction was not signed by the correct sender: Object 0x1 is owned by account address 0x2";
+        assert!(owned(msg).is_wrong_owner());
+        assert!(!owned("object not found yet").is_wrong_owner());
+        assert!(!refused("NoAccess").is_wrong_owner());
+        let all = Error::ThresholdNotReached {
+            got: 0,
+            threshold: 2,
+            failures: Failures(vec![owned(msg), owned(msg)]),
+        };
+        assert!(all.is_wrong_owner());
+        assert!(!all.is_no_access());
+        let mixed = Error::ThresholdNotReached {
+            got: 0,
+            threshold: 2,
+            failures: Failures(vec![owned(msg), Error::Transport("x".into())]),
+        };
+        assert!(!mixed.is_wrong_owner());
     }
 }

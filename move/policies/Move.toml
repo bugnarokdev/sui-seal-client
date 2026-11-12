@@ -1,0 +1,7 @@
+[package]
+name = "seal_policies"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+
+[addresses]
+seal_policies = "0x0"

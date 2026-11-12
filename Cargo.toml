@@ -1,6 +1,6 @@
 [package]
 name = "sui-seal-client"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "High-level Rust client for Mysten Seal (threshold encryption with onchain access control on Sui)"
@@ -38,6 +38,13 @@ futures = "0.3"
 tracing = "0.1"
 uuid = { version = "1", features = ["v4"] }
 zeroize = "1"
+
+[features]
+# Offline helpers for tests (in-process key servers). Never enable in production code.
+testing = []
+
+[package.metadata.docs.rs]
+all-features = true
 
 [dev-dependencies]
 sui-crypto = { version = "0.4", features = ["ed25519", "bech32"] }

@@ -6,8 +6,9 @@ use sui_rpc::field::{FieldMask, FieldMaskUtil};
 use sui_rpc::proto::sui::rpc::v2::{
     GetObjectRequest, ListDynamicFieldsRequest, Object, owner::OwnerKind,
 };
-use sui_sdk_types::Address;
+use sui_sdk_types::{Address, Digest, ObjectReference};
 
+use crate::approval::ApprovalArg;
 use crate::error::{Error, Result};
 
 const RPC_TIMEOUT: Duration = Duration::from_secs(20);
@@ -118,5 +119,43 @@ impl Rpc {
         object
             .version
             .ok_or_else(|| Error::Rpc(format!("object {id}: missing version")))
+    }
+
+    /// Approval argument for any object: shared, or owned/immutable at its current
+    /// version and digest.
+    pub(crate) async fn object_arg(&self, id: &Address) -> Result<ApprovalArg> {
+        let object = self.get_object(id, "version,digest,owner").await?;
+        let owner = object
+            .owner
+            .as_ref()
+            .ok_or_else(|| Error::Rpc(format!("object {id} has no owner info")))?;
+        if owner.kind == Some(OwnerKind::Shared as i32) {
+            let initial_shared_version = owner.version.ok_or_else(|| {
+                Error::Rpc(format!("object {id}: missing initial shared version"))
+            })?;
+            return Ok(ApprovalArg::Shared {
+                id: *id,
+                initial_shared_version,
+            });
+        }
+        let usable = [OwnerKind::Address as i32, OwnerKind::Immutable as i32];
+        if !owner.kind.is_some_and(|k| usable.contains(&k)) {
+            return Err(Error::InvalidInput(format!(
+                "object {id} is neither shared, address-owned nor immutable"
+            )));
+        }
+        let version = object
+            .version
+            .ok_or_else(|| Error::Rpc(format!("object {id}: missing version")))?;
+        let digest = object
+            .digest
+            .as_deref()
+            .ok_or_else(|| Error::Rpc(format!("object {id}: missing digest")))?;
+        let digest: Digest = digest
+            .parse()
+            .map_err(|e| Error::Rpc(format!("object {id}: bad digest {digest}: {e}")))?;
+        Ok(ApprovalArg::Object(ObjectReference::new(
+            *id, version, digest,
+        )))
     }
 }
